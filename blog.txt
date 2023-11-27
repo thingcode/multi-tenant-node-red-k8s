@@ -1,0 +1,157 @@
+Written by and credit to Benjamin Hardill - hardillb@gmail.com
+
+
+Multi Tenant Node-RED with Kubernetes
+
+Having built a working example of Multi Tenant Node-RED using Docker I thought I’d have a look at how to do the same with Kubernetes as a Christmas project.
+
+I started with installing the 64bit build of Ubuntu Server on a fresh Pi4 with 8gb RAM and then using snapd to install microk8s. I had initially wanted to use the 64bit version of Raspberry Pi OS, but despite microk8s claiming to work on any OS that support snapd, I found that containerd just kept crashing on Raspberry Pi OS.
+
+Once installed I enabled the dns and ingress plugins, this got me a minimal viable single node Kubernetes setup working. 
+
+
+I also had to stand up a private docker registry to hold the containers I’ll be using. That was just a case of running docker run -d -p 5000:5000 --name registry registry on a local machine e.g private.example.com . This also means adding the URL for this to microk8s as described here.
+
+Since Kubernetes is another container environment I can reuse most of the parts I previously created. The only bit that really needs to change is the Manager application as this has to interact with the environment to stand up and tear down containers.
+
+Architecture
+
+As before the central components are a MongoDB database and a management web app that stands up and tears down instances. The MongoDB instance holds all the flows and authentication details for each instance. I’ve deployed the database and web app as a single pod and exposed them both as services
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: node-red-multi-tenant
+  labels:
+    app: nr-mt
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: nr-mt
+  template:
+    metadata:
+      labels:
+        app: nr-mt
+    spec:
+      containers:
+      - name: node-red-manager
+        image: private.example.com/k8s-manager
+        ports:
+        - containerPort: 3000
+        volumeMounts:
+        - name: secret
+          mountPath: /usr/src/app/config
+        env:
+        - name: MONGO_URL
+          value: mongodb://mongo/nodered
+        - name: ROOT_DOMAIN
+          value: example.com
+      - name: mongodb
+        image: mongo
+        ports:
+        - containerPort: 27017
+        volumeMounts:
+        - name: mongo-data
+          mountPath: /data/db
+      - name: registry
+        image: verdaccio/verdaccio
+        ports:
+        - containerPort: 4873
+        volumeMounts:
+        - name: registry-data
+          mountPath: /verdaccio/storage
+        - name: registry-conf
+          mountPath: /verdaccio/conf
+      volumes:
+      - name: secret
+        secret:
+          secretName: kube-config
+      - name: mongo-data
+        hostPath:
+          path: /opt/mongo-data
+          type: Directory
+      - name: registry-data
+        hostPath:
+          path: /opt/registry-data
+          type: Directory
+      - name: registry-conf
+        secret:
+          secretName: registry-conf
+          
+This Deployment descriptor basically does all the heavy lifting. It sets up the mangment app, MongoDB and the private NPM registry.
+
+It also binds 2 sets of secrets, the first holds holds the authentication details to interact with the Kubernetes API (the ~/.kube/config file) and the settings.js for the management app. The second is the config for the Veraccio NPM registry.
+
+I’m using the HostPath volume provider to store the MongoDB and the Veraccio registry on the filesystem of the Pi, but for a production deployment I’d probably use the NFS provider or a Cloud Storage option like AWS S3.
+
+Manager
+
+This is mainly the same as the docker version, but I had to swap out dockerode for kubernetes-client.
+
+This library exposes the full kubernetes API allowing the creation/modification/destructions of all entities.
+
+Standing up a new instance is a little more complicated as it’s now a multi step process.
+
+Create a Pod with the custom-node-red container
+Create a Service based on that pod
+Expose that service via the Ingress addon
+
+I also removed the Start/Stop buttons since stopping pods is not really a thing in Kubernetes.
+
+All the code for this version of the app is on github here.
+
+Catalogue
+
+In the Docker-Compose version the custom node `catalogue.json` file is hosted by the management application and had to be manually updated each time a new or updated node was push to the repository. For this version I’ve stood up a separate container.
+
+This container runs a small web app that has 2 endpoints.
+
+/catalogue.json – which returns the current version of the catalogue
+/update – which is triggered by the the notify function of the Verdaccio private npm registry
+The registry has this snippet added to the end of the config.yml
+
+notify:
+  method: POST
+  headers: [{'Content-Type': 'application/json'}]
+  endpoint: http://catalogue/update
+  content: '{"name": "{{name}}", "versions": "{{versions}}", "dist-tags": "{{dist-tags}}"}'
+The code for this container can be found here.
+
+Deploying
+
+First clone the project from github
+
+
+$ github clone --recurse-submodules https://github.com/hardillb/multi-tenant-node-red-k8s.git
+Then run the setup.sh script, passing in the base domain for instances and the host:port combination for the local container registry.
+
+
+$ ./setup.sh example.com private.example.com:5000
+This will update some of the container locations in the deployment and build the secrets needed to access the Kubernetes API (reads the content of ~/.kube/config)
+
+With all the configuration files updated the containers need building and pushing to the local container registry.
+
+$ docker build ./manager -t private.example.com:5000/k8s-manager
+$ docker push private.example.com:5000/k8s-manager
+$ docker build ./catalogue -t private.example.com:5000/catalogue
+$ docker push private.example.com:5000/catalogue
+$ docker build ./custom-node-red -t private.example.com:5000/custom-node-red
+$ docker push private.example.com:5000/custom-node-red
+Finally trigger the actual deployment with kubectl
+
+
+$ kubectl apply -f ./deployment
+Once up and running the management app should be available on http://manager.example.com, the private npm registry on http://registry.example.com and an instance called “r1” would be on http://r1.example.com.
+
+A wildcard DNS entry needs to be setup to point all *.example.com hosts to the Kubernetes clusters Ingress IP addresses.
+
+As usual the whole solution can be found on github here.
+
+What’s Next
+
+I need to work out how to set up Avahi CNAME entries for each deployment as I had working with both nginx and traefik so I can run it all nicely on my LAN without having to mess with /etc/hosts or the local DNS. This should be possible by using a watch call one the Kubernetes Ingress endpoint.
+
+I also need to back port the new catalogue handling to the docker-compose version.
+
+And finally I want to have a look at generating a Helm chart for all this to help get rid of needing the setup.sh script to modify the deployment YAML files.
